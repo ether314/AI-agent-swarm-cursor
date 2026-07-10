@@ -1,0 +1,17 @@
+{
+  "targetRepo": "E:\\AI Projects\\brainstorming",
+  "model": "composer-2.5",
+  "maxConcurrentAgents": 2,
+  "enabledRoles": [
+    "pm",
+    "backend",
+    "frontend",
+    "middleware",
+    "qa",
+    "devops",
+    "oversight"
+  ],
+  "serverPort": 8787,
+  "webPort": 5173,
+  "ceoAutoApprove": true
+}

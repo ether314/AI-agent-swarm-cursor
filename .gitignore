@@ -1,0 +1,13 @@
+node_modules/
+dist/
+data/*.db
+data/*.db-*
+data/repos/
+.env
+.env.local
+*.log
+.DS_Store
+corp-swarm.config.local.json
+apps/web/dist/
+apps/server/dist/
+packages/*/dist/
