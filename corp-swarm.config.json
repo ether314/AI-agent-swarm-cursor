@@ -13,5 +13,8 @@
   ],
   "serverPort": 8787,
   "webPort": 5173,
-  "ceoAutoApprove": true
+  "ceoAutoApprove": true,
+  "silentStallMs": 90000,
+  "maxSilentRetries": 2,
+  "silentWatchdogIntervalMs": 15000
 }

@@ -174,6 +174,12 @@ export const SwarmConfigSchema = z.object({
   webPort: z.number().int().default(5173),
   /** When true, CEO auto-accepts every oversight suggestion (applies role overrides immediately). */
   ceoAutoApprove: z.boolean().default(true),
+  /** Kill + rotate agents that produce no SDK output for this long (ms). */
+  silentStallMs: z.number().int().positive().default(90_000),
+  /** Max automatic requeues per handoff after a silent stall. */
+  maxSilentRetries: z.number().int().positive().default(2),
+  /** How often the silent-run watchdog polls in-flight agents (ms). */
+  silentWatchdogIntervalMs: z.number().int().positive().default(15_000),
   /** Optional GitHub URL or owner/repo that produced the current targetRepo checkout. */
   githubSource: z.string().nullable().optional(),
   githubRef: z.string().nullable().optional(),

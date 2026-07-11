@@ -33,6 +33,11 @@ import {
 } from "./db.js";
 import { bus } from "./events.js";
 import { withTimeout } from "./recover.js";
+import {
+  formatSilentStallMessage,
+  isSilentAgentOutput,
+  isSilentStallMessage,
+} from "./silent-watchdog.js";
 
 /** Max time for a single Cursor agent run (stream + wait). */
 const RUN_TIMEOUT_MS = 10 * 60 * 1000;
@@ -48,6 +53,9 @@ type InflightRun = {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   sdkRun: any;
   handoffId: string | null;
+  role: AgentRole;
+  startedAtMs: number;
+  lastAgentOutputAtMs: number;
 };
 
 function isStaleBusyAgentError(err: unknown): boolean {
@@ -56,9 +64,8 @@ function isStaleBusyAgentError(err: unknown): boolean {
 }
 
 /** Strip orchestrator banner lines to detect runs that produced no agent output. */
-function isSilentAgentOutput(streamed: string): boolean {
-  const body = streamed.replace(/\[orchestrator\][^\n]*\n?/g, "").trim();
-  return body.length === 0;
+function isSilentStream(streamed: string): boolean {
+  return isSilentAgentOutput(streamed);
 }
 
 /** Extract terminal failure details from a Cursor SDK RunResult when present. */
@@ -83,6 +90,10 @@ export class Orchestrator {
   private inflight = new Map<AgentRole, InflightRun>();
   private runningCount = 0;
   private finishedRunsPerRole = new Map<AgentRole, number>();
+  private silentWatchdogTimer: ReturnType<typeof setInterval> | null = null;
+  private silentAbortRunIds = new Set<string>();
+  private silentAbortReasons = new Map<string, string>();
+  private abortingSilentRoles = new Set<AgentRole>();
 
   constructor(
     private db: Db,
@@ -93,6 +104,105 @@ export class Orchestrator {
 
   getActiveRunCount(): number {
     return this.runningCount;
+  }
+
+  /** Poll in-flight SDK runs and abort agents that stall with no streamed output. */
+  startSilentWatchdog(): void {
+    if (this.silentWatchdogTimer) return;
+    const intervalMs = this.config.silentWatchdogIntervalMs;
+    this.silentWatchdogTimer = setInterval(() => {
+      void this.checkSilentInflightRuns();
+    }, intervalMs);
+  }
+
+  stopSilentWatchdog(): void {
+    if (!this.silentWatchdogTimer) return;
+    clearInterval(this.silentWatchdogTimer);
+    this.silentWatchdogTimer = null;
+  }
+
+  private async checkSilentInflightRuns(): Promise<void> {
+    const stallMs = this.config.silentStallMs;
+    const nowMs = Date.now();
+    for (const [role, inflight] of this.inflight) {
+      if (this.abortingSilentRoles.has(role)) continue;
+      const silentForMs = nowMs - inflight.lastAgentOutputAtMs;
+      if (silentForMs < stallMs) continue;
+      const run = getRun(this.db, inflight.dbRunId);
+      if (!run || run.status !== "running") continue;
+      if (!isSilentStream(run.resultText ?? "")) continue;
+      await this.abortSilentRun(
+        role,
+        `no agent output for ${Math.round(silentForMs / 1000)}s`,
+      );
+    }
+  }
+
+  private async abortSilentRun(role: AgentRole, detail: string): Promise<void> {
+    const inflight = this.inflight.get(role);
+    if (!inflight || this.abortingSilentRoles.has(role)) return;
+
+    this.abortingSilentRoles.add(role);
+    const reason = formatSilentStallMessage(
+      `${detail} — disposing agent and scheduling retry`,
+    );
+    this.silentAbortRunIds.add(inflight.dbRunId);
+    this.silentAbortReasons.set(inflight.dbRunId, reason);
+
+    console.warn(`[silent-watchdog] aborting ${role} run ${inflight.dbRunId}: ${detail}`);
+
+    try {
+      if (
+        typeof inflight.sdkRun?.supports === "function" &&
+        inflight.sdkRun.supports("cancel")
+      ) {
+        await inflight.sdkRun.cancel();
+      }
+    } catch (err) {
+      console.warn(`[silent-watchdog] cancel() failed for ${role}`, err);
+    }
+
+    insertMetricEvent(this.db, {
+      id: uuid(),
+      role,
+      kind: "silent_stall_aborted",
+      handoffId: inflight.handoffId,
+      runId: inflight.dbRunId,
+      payload: { detail },
+    });
+
+    await this.handleUnhealthyAgent(role, reason);
+    this.abortingSilentRoles.delete(role);
+  }
+
+  private shouldRetrySilentHandoff(handoff: Handoff, run: ConversationRun): boolean {
+    const silent =
+      isSilentStallMessage(run.failureMessage) ||
+      (run.status === "error" && isSilentStream(run.resultText ?? ""));
+    if (!silent) return false;
+    const attempts = handoff.conversationRunIds.length;
+    return attempts < this.config.maxSilentRetries;
+  }
+
+  private requeueHandoffAfterSilentStall(handoff: Handoff): Handoff {
+    const updated = {
+      ...handoff,
+      status: "queued" as const,
+      failureReason: null,
+      startedAt: null,
+      finishedAt: null,
+      updatedAt: now(),
+    };
+    updateHandoff(this.db, updated);
+    bus.emit({ type: "handoff_updated", handoff: updated });
+    insertMetricEvent(this.db, {
+      id: uuid(),
+      role: handoff.toRole,
+      kind: "silent_stall_requeued",
+      handoffId: handoff.id,
+      payload: { attempt: handoff.conversationRunIds.length },
+    });
+    return updated;
   }
 
   getConfig(): SwarmConfig {
@@ -459,10 +569,14 @@ export class Orchestrator {
       }
       run.cursorRunId = sdkRun.id ?? null;
       updateRun(this.db, run);
+      const startedMs = Date.parse(startedAt);
       this.inflight.set(opts.role, {
         dbRunId: runId,
         sdkRun,
         handoffId: opts.handoffId ?? null,
+        role: opts.role,
+        startedAtMs: startedMs,
+        lastAgentOutputAtMs: startedMs,
       });
 
       let streamed = "";
@@ -477,6 +591,10 @@ export class Orchestrator {
       const emitChunk = (text: string) => {
         if (!text) return;
         streamed += text;
+        const inflight = this.inflight.get(opts.role);
+        if (inflight && !text.includes("[orchestrator]")) {
+          inflight.lastAgentOutputAtMs = Date.now();
+        }
         bus.emit({
           type: "run_chunk",
           runId,
@@ -537,7 +655,7 @@ export class Orchestrator {
 
       if (result.status === "error") {
         const failureMessage = formatSdkRunError(result);
-        const silent = isSilentAgentOutput(streamed);
+        const silent = isSilentStream(streamed);
         if (silent && result.error?.message) {
           emitChunk(`\n[orchestrator] SDK error: ${failureMessage}\n`);
         }
@@ -545,7 +663,9 @@ export class Orchestrator {
           ...run,
           status: "error",
           failureKind: "run_error",
-          failureMessage,
+          failureMessage: silent
+            ? formatSilentStallMessage(`SDK run_error: ${failureMessage}`)
+            : failureMessage,
           resultText: streamed || result.result || null,
           transcriptJson: transcript ? JSON.stringify(transcript) : null,
           finishedAt,
@@ -558,14 +678,31 @@ export class Orchestrator {
           );
         }
       } else if (result.status === "cancelled") {
-        run = {
-          ...run,
-          status: "cancelled",
-          resultText: streamed || result.result || null,
-          transcriptJson: transcript ? JSON.stringify(transcript) : null,
-          finishedAt,
-          durationMs,
-        };
+        const watchdogReason = this.silentAbortReasons.get(runId);
+        if (this.silentAbortRunIds.has(runId) && watchdogReason) {
+          this.silentAbortRunIds.delete(runId);
+          this.silentAbortReasons.delete(runId);
+          emitChunk(`\n[orchestrator] ${watchdogReason}\n`);
+          run = {
+            ...run,
+            status: "error",
+            failureKind: "run_error",
+            failureMessage: watchdogReason,
+            resultText: streamed || result.result || null,
+            transcriptJson: transcript ? JSON.stringify(transcript) : null,
+            finishedAt,
+            durationMs,
+          };
+        } else {
+          run = {
+            ...run,
+            status: "cancelled",
+            resultText: streamed || result.result || null,
+            transcriptJson: transcript ? JSON.stringify(transcript) : null,
+            finishedAt,
+            durationMs,
+          };
+        }
       } else {
         run = {
           ...run,
@@ -589,7 +726,7 @@ export class Orchestrator {
           cursorRunId: run.cursorRunId,
           failureMessage: run.failureMessage ?? undefined,
           silentFailure:
-            run.status === "error" ? isSilentAgentOutput(streamed) : undefined,
+            run.status === "error" ? isSilentStream(streamed) : undefined,
         },
       });
       bus.emit({ type: "run_finished", run });
@@ -725,17 +862,41 @@ export class Orchestrator {
       `Enabled specialists: ${this.config.enabledRoles.filter((r) => r !== "pm" && r !== "oversight").join(", ")}`,
     ].join("\n");
 
-    const run = await this.runPrompt({
-      role: "pm",
-      prompt: planPrompt,
-      goalId,
-    });
+    let lastRun: ConversationRun | null = null;
+    for (let attempt = 1; attempt <= this.config.maxSilentRetries; attempt++) {
+      const run = await this.runPrompt({
+        role: "pm",
+        prompt: planPrompt,
+        goalId,
+      });
+      lastRun = run;
 
-    if (run.status !== "finished" || !run.resultText) {
+      if (run.status === "finished" && run.resultText) {
+        return this.createHandoffsFromPmRun(goalId, prompt, run);
+      }
+
+      const silentPlanning =
+        isSilentStallMessage(run.failureMessage) ||
+        (run.status === "error" && isSilentStream(run.resultText ?? ""));
+      if (silentPlanning && attempt < this.config.maxSilentRetries) {
+        console.warn(
+          `[silent-watchdog] PM planning stall attempt ${attempt}/${this.config.maxSilentRetries} — retrying`,
+        );
+        continue;
+      }
+
       throw new Error(run.failureMessage ?? "PM planning failed");
     }
 
-    const plan = this.extractJson(run.resultText, PmPlanSchema);
+    throw new Error(lastRun?.failureMessage ?? "PM planning failed");
+  }
+
+  private createHandoffsFromPmRun(
+    goalId: string,
+    prompt: string,
+    run: ConversationRun,
+  ): Handoff[] {
+    const plan = this.extractJson(run.resultText!, PmPlanSchema);
     if (!plan) {
       // Fallback: single backend handoff so the swarm can still move
       const fallback = this.createHandoffRecord({
@@ -820,6 +981,9 @@ export class Orchestrator {
     handoff.updatedAt = now();
 
     if (run.status !== "finished") {
+      if (this.shouldRetrySilentHandoff(handoff, run)) {
+        return this.requeueHandoffAfterSilentStall(handoff);
+      }
       handoff.status = "failed";
       handoff.failureReason = run.failureMessage ?? `Run status ${run.status}`;
       handoff.finishedAt = now();

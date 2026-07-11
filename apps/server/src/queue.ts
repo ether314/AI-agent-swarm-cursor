@@ -29,6 +29,7 @@ export class SwarmQueue {
 
   start(intervalMs = 1500): void {
     if (this.timer) return;
+    this.orchestrator.startSilentWatchdog();
     this.timer = setInterval(() => {
       void this.tick();
     }, intervalMs);
@@ -36,6 +37,7 @@ export class SwarmQueue {
   }
 
   stop(): void {
+    this.orchestrator.stopSilentWatchdog();
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
@@ -137,6 +139,7 @@ export class SwarmQueue {
         queueDepth: countQueuedHandoffs(this.db),
       });
       this.maybeCompleteGoals();
+      void this.tick();
     }
   }
 
