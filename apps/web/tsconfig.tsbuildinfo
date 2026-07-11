@@ -1,1 +1,1 @@
-{"root":["./src/app.tsx","./src/main.tsx","./src/vite-env.d.ts"],"version":"5.9.3"}
+{"root":["./src/app.tsx","./src/ceodirectivepanel.tsx","./src/ceorequestspanel.tsx","./src/ceoreviewpanel.tsx","./src/goaltrackerpanel.tsx","./src/livetranscript.tsx","./src/promptportalpanel.tsx","./src/ceo-requests-format.ts","./src/goal-tracker.ts","./src/main.tsx","./src/transcript-format.ts","./src/vite-env.d.ts"],"version":"5.9.3"}

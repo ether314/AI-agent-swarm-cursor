@@ -3,7 +3,8 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "tsx src/index.ts",
+    "dev": "tsx watch src/index.ts",
+    "dev:once": "tsx src/index.ts",
     "dev:watch": "tsx watch src/index.ts",
     "start": "tsx src/index.ts",
     "build": "tsc",

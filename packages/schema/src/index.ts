@@ -54,6 +54,8 @@ export const HandoffSchema = z.object({
   startedAt: z.string().nullable().optional(),
   finishedAt: z.string().nullable().optional(),
   failureReason: z.string().nullable().optional(),
+  /** Pipeline wave (1=infra/build, 2=frontend, 3=qa, 4=devops). Lower phases must finish first. */
+  gatePhase: z.number().int().positive().default(1),
   createdAt: z.string(),
   updatedAt: z.string(),
 });
@@ -86,6 +88,8 @@ export const GoalSchema = z.object({
   title: z.string(),
   prompt: z.string(),
   status: GoalStatusSchema,
+  /** Rolling compact memo for cross-agent context (token compression). */
+  contextDigest: z.string().nullable().optional(),
   createdAt: z.string(),
   updatedAt: z.string(),
 });
@@ -110,12 +114,18 @@ export const ConversationRunSchema = z.object({
   status: RunStatusSchema,
   prompt: z.string(),
   resultText: z.string().nullable(),
+  /** Short post-run summary for digests (not full resultText). */
+  resultSummary: z.string().nullable().optional(),
   failureKind: z.enum(["none", "run_error", "startup_error"]).default("none"),
   failureMessage: z.string().nullable(),
   transcriptJson: z.string().nullable(),
   startedAt: z.string(),
   finishedAt: z.string().nullable(),
   durationMs: z.number().nullable(),
+  inputTokens: z.number().int().nonnegative().nullable().optional(),
+  outputTokens: z.number().int().nonnegative().nullable().optional(),
+  totalTokens: z.number().int().nonnegative().nullable().optional(),
+  model: z.string().nullable().optional(),
 });
 export type ConversationRun = z.infer<typeof ConversationRunSchema>;
 
@@ -157,6 +167,17 @@ export const ProjectBriefSchema = z.object({
 });
 export type ProjectBrief = z.infer<typeof ProjectBriefSchema>;
 
+export const ContextCapsSchema = z.object({
+  objective: z.number().int().positive().default(400),
+  contextSummary: z.number().int().positive().default(800),
+  acceptanceCriteriaItem: z.number().int().positive().default(120),
+  maxAcceptanceCriteria: z.number().int().positive().default(5),
+  digest: z.number().int().positive().default(1500),
+  resultSummary: z.number().int().positive().default(500),
+  roleOverride: z.number().int().positive().default(300),
+});
+export type ContextCaps = z.infer<typeof ContextCapsSchema>;
+
 export const SwarmConfigSchema = z.object({
   targetRepo: z.string().min(1),
   model: z.string().default("composer-2.5"),
@@ -175,11 +196,24 @@ export const SwarmConfigSchema = z.object({
   /** When true, CEO auto-accepts every oversight suggestion (applies role overrides immediately). */
   ceoAutoApprove: z.boolean().default(true),
   /** Kill + rotate agents that produce no SDK output for this long (ms). */
-  silentStallMs: z.number().int().positive().default(90_000),
+  silentStallMs: z.number().int().positive().default(120_000),
   /** Max automatic requeues per handoff after a silent stall. */
   maxSilentRetries: z.number().int().positive().default(2),
   /** How often the silent-run watchdog polls in-flight agents (ms). */
   silentWatchdogIntervalMs: z.number().int().positive().default(15_000),
+  /** Enforce wave ordering + one active handoff per goal (reduces parallel dispatch friction). */
+  sequentialPipeline: z.boolean().default(true),
+  /** Max simultaneous handoffs per goal when sequentialPipeline is on (usually 1). */
+  maxConcurrentPerGoal: z.number().int().positive().default(1),
+  /**
+   * When true (default), dispose the Cursor agent after every run and never resume
+   * prior conversation history — largest token-cost saver.
+   */
+  freshAgentPerRun: z.boolean().default(true),
+  /** Max role overrides injected into the system prompt (latest N). */
+  maxRoleOverridesInPrompt: z.number().int().positive().default(3),
+  /** Hard caps for handoff/goal context strings. */
+  contextCaps: ContextCapsSchema.default({}),
   /** Optional GitHub URL or owner/repo that produced the current targetRepo checkout. */
   githubSource: z.string().nullable().optional(),
   githubRef: z.string().nullable().optional(),
@@ -229,6 +263,172 @@ export const MetricsSnapshotSchema = z.object({
   activeRuns: z.number(),
 });
 export type MetricsSnapshot = z.infer<typeof MetricsSnapshotSchema>;
+
+export const GoalOutcomeSchema = z.enum([
+  "success",
+  "failed",
+  "in_progress",
+  "cancelled",
+]);
+export type GoalOutcome = z.infer<typeof GoalOutcomeSchema>;
+
+/** One pipeline step for a goal — handoff gate or agent run from the database. */
+export const GoalAgentStepSchema = z.object({
+  id: z.string(),
+  kind: z.enum(["handoff", "run"]),
+  /** ISO timestamp for ordering steps in the timeline. */
+  sortAt: z.string(),
+  role: AgentRoleSchema,
+  fromRole: AgentRoleSchema.nullable().optional(),
+  toRole: AgentRoleSchema.nullable().optional(),
+  handoffId: z.string().nullable(),
+  runId: z.string().nullable(),
+  label: z.string(),
+  status: z.string(),
+  gatePhase: z.number().nullable(),
+  durationMs: z.number().nullable(),
+  inputTokens: z.number().nullable(),
+  outputTokens: z.number().nullable(),
+  totalTokens: z.number().nullable(),
+  model: z.string().nullable(),
+  estimatedCostUsd: z.number().nullable(),
+  failureMessage: z.string().nullable(),
+});
+export type GoalAgentStep = z.infer<typeof GoalAgentStepSchema>;
+
+/** Per-agent rollup for a single CEO directive. */
+export const GoalRoleMetricsSchema = z.object({
+  role: AgentRoleSchema,
+  runs: z.number(),
+  handoffsReceived: z.number(),
+  failedOrRejectedHandoffs: z.number(),
+  durationMs: z.number().nullable(),
+  inputTokens: z.number().nullable(),
+  outputTokens: z.number().nullable(),
+  totalTokens: z.number().nullable(),
+  estimatedCostUsd: z.number().nullable(),
+  primaryModel: z.string().nullable(),
+});
+export type GoalRoleMetrics = z.infer<typeof GoalRoleMetricsSchema>;
+
+export const GoalMetricsSchema = z.object({
+  goalId: z.string(),
+  title: z.string(),
+  prompt: z.string(),
+  status: GoalStatusSchema,
+  outcome: GoalOutcomeSchema,
+  outcomeSummary: z.string(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+  /** Wall-clock time from goal created to last update (or now if still active). */
+  durationMs: z.number().nullable(),
+  /** Sum of agent run durations for this goal. */
+  agentTimeMs: z.number().nullable(),
+  totalRuns: z.number(),
+  /** Distinct Cursor agent instances used. */
+  agentsSpunUp: z.number(),
+  rolesInvolved: z.array(AgentRoleSchema),
+  totalHandoffs: z.number(),
+  failedHandoffs: z.number(),
+  rejectedHandoffs: z.number(),
+  inputTokens: z.number().nullable(),
+  outputTokens: z.number().nullable(),
+  totalTokens: z.number().nullable(),
+  /** Primary model id used across agent runs (most frequent). */
+  primaryModel: z.string().nullable(),
+  /** All model ids observed on runs for this goal. */
+  modelsUsed: z.array(z.string()),
+  /** Estimated USD from token usage (indicative — not billing). */
+  estimatedCostUsd: z.number().nullable(),
+  /** Length of the rolling goal context digest (token-compression observability). */
+  contextDigestChars: z.number().int().nonnegative().nullable().optional(),
+  /** Ordered agent steps (handoffs + runs) stored for this goal. */
+  steps: z.array(GoalAgentStepSchema),
+  /** Metrics rolled up per agent role. */
+  byRole: z.array(GoalRoleMetricsSchema),
+});
+export type GoalMetrics = z.infer<typeof GoalMetricsSchema>;
+
+export const GoalMetricsSnapshotSchema = z.object({
+  goals: z.array(GoalMetricsSchema),
+  totals: z.object({
+    requests: z.number(),
+    successCount: z.number(),
+    failedCount: z.number(),
+    inProgressCount: z.number(),
+    totalTokens: z.number().nullable(),
+    totalAgentRuns: z.number(),
+    estimatedTotalCostUsd: z.number().nullable(),
+    primaryModel: z.string().nullable(),
+    avgDurationMs: z.number().nullable(),
+  }),
+});
+export type GoalMetricsSnapshot = z.infer<typeof GoalMetricsSnapshotSchema>;
+
+export const PromptChangeKindSchema = z.enum([
+  "base_pack",
+  "override_applied",
+  "suggestion_proposed",
+  "suggestion_accepted",
+  "suggestion_rejected",
+]);
+export type PromptChangeKind = z.infer<typeof PromptChangeKindSchema>;
+
+export const PromptChangeEventSchema = z.object({
+  id: z.string(),
+  role: AgentRoleSchema,
+  kind: PromptChangeKindSchema,
+  summary: z.string(),
+  detail: z.string().nullable(),
+  sourceId: z.string().nullable(),
+  createdAt: z.string(),
+});
+export type PromptChangeEvent = z.infer<typeof PromptChangeEventSchema>;
+
+export const RolePackViewSchema = z.object({
+  role: AgentRoleSchema,
+  title: z.string(),
+  mission: z.string(),
+  boundaries: z.array(z.string()),
+  successCriteria: z.array(z.string()),
+  handoffContract: z.string(),
+});
+export type RolePackView = z.infer<typeof RolePackViewSchema>;
+
+export const RolePromptViewSchema = z.object({
+  role: AgentRoleSchema,
+  title: z.string(),
+  hasSystemPrompt: z.boolean(),
+  basePack: RolePackViewSchema.nullable(),
+  activeOverrides: z.array(z.string()),
+  effectiveSystemPrompt: z.string(),
+  changeCount: z.number(),
+  lastChangedAt: z.string().nullable(),
+  changes: z.array(PromptChangeEventSchema),
+});
+export type RolePromptView = z.infer<typeof RolePromptViewSchema>;
+
+export const RuntimePromptTemplateSchema = z.object({
+  id: z.string(),
+  title: z.string(),
+  usedByRole: AgentRoleSchema.nullable(),
+  description: z.string(),
+  template: z.string(),
+});
+export type RuntimePromptTemplate = z.infer<typeof RuntimePromptTemplateSchema>;
+
+export const PromptPortalSnapshotSchema = z.object({
+  projectBriefSummary: z.string(),
+  roles: z.array(RolePromptViewSchema),
+  runtimeTemplates: z.array(RuntimePromptTemplateSchema),
+  totals: z.object({
+    rolesWithOverrides: z.number(),
+    totalOverrides: z.number(),
+    totalChanges: z.number(),
+    lastChangedAt: z.string().nullable(),
+  }),
+});
+export type PromptPortalSnapshot = z.infer<typeof PromptPortalSnapshotSchema>;
 
 export const WsEventSchema = z.discriminatedUnion("type", [
   z.object({
@@ -303,6 +503,8 @@ export const PmPlanSchema = z.object({
         objective: z.string(),
         contextSummary: z.string().default(""),
         acceptanceCriteria: z.array(z.string()).default([]),
+        /** Pipeline wave: 1=backend/infra, 2=frontend, 3=qa, 4=devops. */
+        phase: z.number().int().positive().optional(),
       }),
     )
     .min(1),

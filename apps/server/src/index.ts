@@ -15,6 +15,7 @@ import {
   acceptAllPendingSuggestions,
 } from "./db.js";
 import { sniffProject } from "./project-brief.js";
+import { syncBasePackChangeLog } from "./prompt-portal.js";
 import { Orchestrator } from "./orchestrator.js";
 import { SwarmQueue } from "./queue.js";
 import { createApp } from "./app.js";
@@ -27,6 +28,7 @@ async function main() {
   const config = loadConfig();
   const brief = sniffProject(config.targetRepo);
   const db = openDb();
+  syncBasePackChangeLog(db);
 
   for (const role of WORKER_ROLES) {
     if (!getAgentInstance(db, role)) {
@@ -62,7 +64,10 @@ async function main() {
   const apiKeyPresent = Boolean(apiKey) && !apiKey.includes("...");
 
   const orchestrator = new Orchestrator(db, config, brief, apiKey);
-  const queue = new SwarmQueue(db, orchestrator, config.maxConcurrentAgents);
+  const queue = new SwarmQueue(db, orchestrator, config.maxConcurrentAgents, {
+    sequentialPipeline: config.sequentialPipeline,
+    maxConcurrentPerGoal: config.maxConcurrentPerGoal,
+  });
   queue.start(1500);
 
   const app = createApp({

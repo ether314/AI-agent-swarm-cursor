@@ -20,8 +20,12 @@ import {
   listSuggestions,
   acceptSuggestion,
   updateSuggestionStatus,
+  failGoal,
+  getGoal,
 } from "./db.js";
 import { computeMetrics } from "./metrics.js";
+import { computeGoalMetrics } from "./goal-metrics.js";
+import { computePromptPortal } from "./prompt-portal.js";
 import type { Orchestrator } from "./orchestrator.js";
 import type { SwarmQueue } from "./queue.js";
 import { recoverStuckWork } from "./recover.js";
@@ -167,6 +171,30 @@ export function createApp(deps: AppDeps) {
     return c.json({ goal }, 201);
   });
 
+  app.post("/api/goals/:id/fail", (c) => {
+    const id = c.req.param("id");
+    if (!getGoal(deps.db, id)) return c.json({ error: "not found" }, 404);
+
+    const before = new Map(
+      listHandoffs(deps.db)
+        .filter((h) => h.goalId === id)
+        .map((h) => [h.id, h.status] as const),
+    );
+    const goal = failGoal(deps.db, id)!;
+    bus.emit({ type: "goal_updated", goal });
+    for (const handoff of listHandoffs(deps.db).filter((h) => h.goalId === id)) {
+      if (before.get(handoff.id) !== handoff.status) {
+        bus.emit({ type: "handoff_updated", handoff });
+      }
+    }
+    bus.emit({
+      type: "swarm_state",
+      paused: isPaused(deps.db),
+      queueDepth: countQueuedHandoffs(deps.db),
+    });
+    return c.json({ goal });
+  });
+
   app.post("/api/swarm/pause", (c) => {
     deps.queue.pause();
     return c.json({ paused: true });
@@ -195,6 +223,12 @@ export function createApp(deps: AppDeps) {
   });
 
   app.get("/api/metrics", (c) => c.json(computeMetrics(deps.db)));
+
+  app.get("/api/goals/metrics", (c) =>
+    c.json(computeGoalMetrics(deps.db, deps.config.model)),
+  );
+
+  app.get("/api/prompts", (c) => c.json(computePromptPortal(deps.db, deps.brief)));
 
   app.get("/api/suggestions", (c) =>
     c.json({ suggestions: listSuggestions(deps.db) }),

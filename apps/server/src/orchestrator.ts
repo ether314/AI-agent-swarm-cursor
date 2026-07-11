@@ -2,6 +2,7 @@ import { v4 as uuid } from "uuid";
 import { Agent, CursorAgentError } from "@cursor/sdk";
 import {
   PmPlanSchema,
+  type PmPlan,
   SpecialistResultSchema,
   OversightOutputSchema,
   type AgentRole,
@@ -15,10 +16,13 @@ import {
   buildSystemPrompt,
   canHandoff,
   getRolePack,
+  resolveFollowUpHandoff,
+  BLOG_DOMAIN_ADDENDUM,
 } from "@corp-swarm/roles";
 import type { Db } from "./db.js";
 import {
   getAgentInstance,
+  getGoal,
   insertHandoff,
   insertMetricEvent,
   insertRun,
@@ -26,11 +30,18 @@ import {
   listRoleOverrides,
   getRun,
   now,
+  updateGoalDigest,
   updateHandoff,
   updateRun,
   upsertAgentInstance,
   acceptSuggestion,
 } from "./db.js";
+import {
+  gatePhaseForFollowUp,
+  inferGatePhase,
+  normalizePmPlan,
+} from "./handoff-gates.js";
+import { buildSmokeTestPlan, isSmokeTestGoal } from "./smoke-test-plan.js";
 import { bus } from "./events.js";
 import { withTimeout } from "./recover.js";
 import {
@@ -38,9 +49,46 @@ import {
   isSilentAgentOutput,
   isSilentStallMessage,
 } from "./silent-watchdog.js";
+import {
+  appendGoalDigest,
+  buildHandoffContext,
+  compressAcceptanceCriteria,
+  compressContextSummary,
+  compressObjective,
+  compressOverrides,
+  compressResultSummary,
+  formatDigestLine,
+  needsBlogDomainAddendum,
+  normalizePmHandoffContext,
+  resolveContextCaps,
+  seedGoalDigestFromPlan,
+} from "./context-compress.js";
 
 /** Max time for a single Cursor agent run (stream + wait). */
 const RUN_TIMEOUT_MS = 10 * 60 * 1000;
+
+/** Fallback rotate threshold when freshAgentPerRun is false. */
+const AGENT_ROTATE_AFTER_RUNS = 6;
+
+type TokenFields = Pick<
+  ConversationRun,
+  "inputTokens" | "outputTokens" | "totalTokens"
+>;
+
+function tokenFieldsFromUsage(usage?: {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+}): TokenFields {
+  if (!usage) {
+    return { inputTokens: null, outputTokens: null, totalTokens: null };
+  }
+  return {
+    inputTokens: usage.inputTokens,
+    outputTokens: usage.outputTokens,
+    totalTokens: usage.totalTokens,
+  };
+}
 
 type ActiveAgent = {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -81,9 +129,6 @@ function formatSdkRunError(result: {
   if (result.result?.trim()) return result.result.trim().slice(0, 500);
   return `Cursor run ${result.id ?? "unknown"} failed`;
 }
-
-/** Rotate long-lived agents to avoid context bloat and silent SDK failures. */
-const AGENT_ROTATE_AFTER_RUNS = 6;
 
 export class Orchestrator {
   private active = new Map<AgentRole, ActiveAgent>();
@@ -405,6 +450,11 @@ export class Orchestrator {
     const pack = getRolePack(role);
     if (!pack) throw new Error(`No role pack for ${role}`);
 
+    // Default: never resume — SDK history is the largest token cost driver.
+    if (this.config.freshAgentPerRun !== false) {
+      return this.createFreshAgent(role);
+    }
+
     const instance = getAgentInstance(this.db, role);
 
     if (instance?.cursorAgentId) {
@@ -458,6 +508,11 @@ export class Orchestrator {
   }
 
   private noteFinishedRun(role: AgentRole): void {
+    if (this.config.freshAgentPerRun !== false) {
+      this.finishedRunsPerRole.set(role, 0);
+      void this.disposeRoleAgent(role);
+      return;
+    }
     const count = (this.finishedRunsPerRole.get(role) ?? 0) + 1;
     this.finishedRunsPerRole.set(role, count);
     if (count >= AGENT_ROTATE_AFTER_RUNS) {
@@ -475,11 +530,27 @@ export class Orchestrator {
     this.finishedRunsPerRole.set(role, 0);
   }
 
-  private getSystemPrompt(role: AgentRole): string {
+  private getSystemPrompt(
+    role: AgentRole,
+    domainHints: Array<string | null | undefined> = [],
+  ): string {
     const pack = getRolePack(role);
     if (!pack) return "";
-    const overrides = listRoleOverrides(this.db, role);
-    return buildSystemPrompt(pack, this.brief.summary, overrides);
+    const caps = resolveContextCaps(this.config);
+    const maxOverrides = this.config.maxRoleOverridesInPrompt ?? 3;
+    const overrides = compressOverrides(
+      listRoleOverrides(this.db, role),
+      maxOverrides,
+      caps,
+    );
+    const domainAddendum =
+      role === "backend" && needsBlogDomainAddendum(...domainHints)
+        ? BLOG_DOMAIN_ADDENDUM
+        : null;
+    return buildSystemPrompt(pack, this.brief.summary, {
+      overrides,
+      domainAddendum,
+    });
   }
 
   async runPrompt(opts: {
@@ -487,6 +558,7 @@ export class Orchestrator {
     prompt: string;
     handoffId?: string | null;
     goalId?: string | null;
+    domainHints?: Array<string | null | undefined>;
   }): Promise<ConversationRun> {
     const startedAt = now();
     const runId = uuid();
@@ -500,12 +572,17 @@ export class Orchestrator {
       status: "running",
       prompt: opts.prompt,
       resultText: null,
+      resultSummary: null,
       failureKind: "none",
       failureMessage: null,
       transcriptJson: null,
       startedAt,
       finishedAt: null,
       durationMs: null,
+      inputTokens: null,
+      outputTokens: null,
+      totalTokens: null,
+      model: null,
     };
     insertRun(this.db, run);
     bus.emit({ type: "run_started", run });
@@ -526,7 +603,7 @@ export class Orchestrator {
     });
 
     const fullPrompt = [
-      this.getSystemPrompt(opts.role),
+      this.getSystemPrompt(opts.role, opts.domainHints ?? [opts.prompt]),
       "",
       "---",
       "",
@@ -643,6 +720,8 @@ export class Orchestrator {
       );
       const finishedAt = now();
       const durationMs = Date.parse(finishedAt) - Date.parse(startedAt);
+      const tokens = tokenFieldsFromUsage(result.usage);
+      const runModel = result.model?.id ?? this.config.model;
 
       let transcript: unknown = null;
       try {
@@ -670,6 +749,8 @@ export class Orchestrator {
           transcriptJson: transcript ? JSON.stringify(transcript) : null,
           finishedAt,
           durationMs,
+          ...tokens,
+          model: runModel,
         };
         if (silent) {
           await this.handleUnhealthyAgent(
@@ -692,6 +773,8 @@ export class Orchestrator {
             transcriptJson: transcript ? JSON.stringify(transcript) : null,
             finishedAt,
             durationMs,
+            ...tokens,
+            model: runModel,
           };
         } else {
           run = {
@@ -701,6 +784,8 @@ export class Orchestrator {
             transcriptJson: transcript ? JSON.stringify(transcript) : null,
             finishedAt,
             durationMs,
+            ...tokens,
+            model: runModel,
           };
         }
       } else {
@@ -711,6 +796,8 @@ export class Orchestrator {
           transcriptJson: transcript ? JSON.stringify(transcript) : null,
           finishedAt,
           durationMs,
+          ...tokens,
+          model: runModel,
         };
         this.noteFinishedRun(opts.role);
       }
@@ -742,6 +829,7 @@ export class Orchestrator {
         failureMessage: err instanceof Error ? err.message : String(err),
         finishedAt,
         durationMs,
+        model: this.config.model,
       };
       updateRun(this.db, run);
       if (!isStartup) {
@@ -769,14 +857,25 @@ export class Orchestrator {
     } finally {
       this.inflight.delete(opts.role);
       this.runningCount = Math.max(0, this.runningCount - 1);
-      const inst = getAgentInstance(this.db, opts.role);
-      upsertAgentInstance(this.db, {
-        role: opts.role,
-        cursorAgentId: inst?.cursorAgentId ?? run.cursorAgentId,
-        status: "idle",
-        lastRunId: runId,
-        updatedAt: now(),
-      });
+      if (this.config.freshAgentPerRun !== false) {
+        await this.disposeRoleAgent(opts.role);
+        upsertAgentInstance(this.db, {
+          role: opts.role,
+          cursorAgentId: null,
+          status: "idle",
+          lastRunId: runId,
+          updatedAt: now(),
+        });
+      } else {
+        const inst = getAgentInstance(this.db, opts.role);
+        upsertAgentInstance(this.db, {
+          role: opts.role,
+          cursorAgentId: inst?.cursorAgentId ?? run.cursorAgentId,
+          status: "idle",
+          lastRunId: runId,
+          updatedAt: now(),
+        });
+      }
       bus.emit({
         type: "agent_status",
         role: opts.role,
@@ -812,21 +911,29 @@ export class Orchestrator {
     acceptanceCriteria?: string[];
     parentHandoffId?: string | null;
     goalId?: string | null;
+    gatePhase?: number;
   }): Handoff {
     if (!canHandoff(input.fromRole, input.toRole)) {
       throw new Error(
         `Handoff not allowed: ${input.fromRole} → ${input.toRole}`,
       );
     }
+    const caps = resolveContextCaps(this.config);
     const ts = now();
+    const objective = compressObjective(input.objective, caps);
+    const gatePhase =
+      input.gatePhase ?? inferGatePhase(objective, input.toRole);
     const handoff: Handoff = {
       id: uuid(),
       fromRole: input.fromRole,
       toRole: input.toRole,
       status: "queued",
-      objective: input.objective,
-      contextSummary: input.contextSummary ?? "",
-      acceptanceCriteria: input.acceptanceCriteria ?? [],
+      objective,
+      contextSummary: compressContextSummary(input.contextSummary ?? "", caps),
+      acceptanceCriteria: compressAcceptanceCriteria(
+        input.acceptanceCriteria ?? [],
+        caps,
+      ),
       artifacts: [],
       parentHandoffId: input.parentHandoffId ?? null,
       goalId: input.goalId ?? null,
@@ -834,6 +941,7 @@ export class Orchestrator {
       startedAt: null,
       finishedAt: null,
       failureReason: null,
+      gatePhase,
       createdAt: ts,
       updatedAt: ts,
     };
@@ -843,23 +951,30 @@ export class Orchestrator {
       role: input.fromRole,
       kind: "handoff_created",
       handoffId: handoff.id,
-      payload: { toRole: input.toRole },
+      payload: { toRole: input.toRole, gatePhase },
     });
     bus.emit({ type: "handoff_updated", handoff });
     return handoff;
   }
 
   async planGoal(goalId: string, prompt: string): Promise<Handoff[]> {
+    if (isSmokeTestGoal(prompt)) {
+      console.log(
+        `[planGoal] smoke test detected — using deterministic 4-wave canary plan`,
+      );
+      return this.createHandoffsFromPmPlan(goalId, buildSmokeTestPlan(prompt));
+    }
+
     const planPrompt = [
-      "You are the Project Manager. The CEO issued this goal.",
+      "CEO goal → phased specialist handoffs. Pipeline phases are enforced in code.",
       "",
       `GOAL: ${prompt}`,
       "",
-      "Produce a JSON object ONLY (optionally in a ```json fence) matching:",
-      '{ "summary": string, "handoffs": [{ "toRole": "backend"|"frontend"|"middleware"|"qa"|"devops", "objective": string, "contextSummary": string, "acceptanceCriteria": string[] }] }',
+      "Return JSON ONLY:",
+      '{ "summary": string, "handoffs": [{ "phase": number, "toRole": "backend"|"frontend"|"middleware"|"qa"|"devops", "objective": string, "contextSummary": string, "acceptanceCriteria": string[] }] }',
       "",
-      "Create at least one handoff. Prefer the smallest set of specialists needed.",
-      `Enabled specialists: ${this.config.enabledRoles.filter((r) => r !== "pm" && r !== "oversight").join(", ")}`,
+      "Prefer fewest specialists; one handoff per phase when possible. Keep contextSummary short and task-specific (do not repeat the full plan summary).",
+      `Enabled: ${this.config.enabledRoles.filter((r) => r !== "pm" && r !== "oversight").join(", ")}`,
     ].join("\n");
 
     let lastRun: ConversationRun | null = null;
@@ -868,6 +983,7 @@ export class Orchestrator {
         role: "pm",
         prompt: planPrompt,
         goalId,
+        domainHints: [prompt],
       });
       lastRun = run;
 
@@ -896,14 +1012,20 @@ export class Orchestrator {
     prompt: string,
     run: ConversationRun,
   ): Handoff[] {
+    const caps = resolveContextCaps(this.config);
     const plan = this.extractJson(run.resultText!, PmPlanSchema);
     if (!plan) {
-      // Fallback: single backend handoff so the swarm can still move
+      const fallbackSummary = compressResultSummary(
+        "PM could not parse structured plan",
+        caps,
+      );
+      run.resultSummary = fallbackSummary;
+      updateRun(this.db, run);
       const fallback = this.createHandoffRecord({
         fromRole: "pm",
         toRole: "backend",
         objective: prompt,
-        contextSummary: `PM could not parse structured plan. Raw output logged in run ${run.id}.`,
+        contextSummary: `PM parse failed. Raw in run ${run.id}.`,
         acceptanceCriteria: [
           "Address the CEO goal as far as possible in this repository",
           "Document what was done and what remains",
@@ -913,17 +1035,33 @@ export class Orchestrator {
       return [fallback];
     }
 
+    run.resultSummary = compressResultSummary(plan.summary, caps);
+    updateRun(this.db, run);
+    return this.createHandoffsFromPmPlan(goalId, plan);
+  }
+
+  private createHandoffsFromPmPlan(goalId: string, plan: PmPlan): Handoff[] {
+    const caps = resolveContextCaps(this.config);
+    const normalized = normalizePmPlan(plan, this.config.enabledRoles);
+    updateGoalDigest(
+      this.db,
+      goalId,
+      seedGoalDigestFromPlan(normalized.summary, caps),
+    );
+
     const created: Handoff[] = [];
-    for (const h of plan.handoffs) {
+    for (const h of normalized.handoffs) {
       if (!this.config.enabledRoles.includes(h.toRole)) continue;
+      const phase = h.phase ?? inferGatePhase(h.objective, h.toRole);
       created.push(
         this.createHandoffRecord({
           fromRole: "pm",
           toRole: h.toRole,
           objective: h.objective,
-          contextSummary: `${plan.summary}\n\n${h.contextSummary}`,
+          contextSummary: normalizePmHandoffContext(h.contextSummary, caps),
           acceptanceCriteria: h.acceptanceCriteria,
           goalId,
+          gatePhase: phase,
         }),
       );
     }
@@ -932,8 +1070,8 @@ export class Orchestrator {
         this.createHandoffRecord({
           fromRole: "pm",
           toRole: "backend",
-          objective: prompt,
-          contextSummary: plan.summary,
+          objective: "Wave 1 of 1 — address CEO goal",
+          contextSummary: normalizePmHandoffContext(normalized.summary, caps),
           acceptanceCriteria: ["Complete the goal or document blockers"],
           goalId,
         }),
@@ -953,20 +1091,29 @@ export class Orchestrator {
     updateHandoff(this.db, handoff);
     bus.emit({ type: "handoff_updated", handoff });
 
+    const caps = resolveContextCaps(this.config);
+    const goal = handoff.goalId ? getGoal(this.db, handoff.goalId) : null;
+    const contextBlock = buildHandoffContext({
+      goalDigest: goal?.contextDigest,
+      handoffContext: handoff.contextSummary,
+      caps,
+    });
+    const criteria = compressAcceptanceCriteria(
+      handoff.acceptanceCriteria,
+      caps,
+    );
+
     const prompt = [
-      `HANDOFF ID: ${handoff.id}`,
-      `FROM: ${handoff.fromRole}`,
-      `TO: ${handoff.toRole}`,
+      `FROM: ${handoff.fromRole} → ${handoff.toRole}`,
+      `OBJECTIVE: ${compressObjective(handoff.objective, caps)}`,
       "",
-      `OBJECTIVE: ${handoff.objective}`,
+      contextBlock,
       "",
-      `CONTEXT: ${handoff.contextSummary}`,
+      "ACCEPTANCE:",
+      ...criteria.map((c, i) => `${i + 1}. ${c}`),
       "",
-      "ACCEPTANCE CRITERIA:",
-      ...handoff.acceptanceCriteria.map((c, i) => `${i + 1}. ${c}`),
-      "",
-      "Execute this handoff in the target repository.",
-      "When finished, respond with JSON ONLY matching SpecialistResult:",
+      "Execute in the target repo. Stream tool use immediately.",
+      "Finish with JSON ONLY:",
       '{ "status": "done"|"failed"|"blocked", "summary": string, "artifacts": [{"kind":"path"|"url"|"log_ref"|"note","value":string,"label"?:string}], "followUpHandoffs": [{"toRole": string, "objective": string, "contextSummary"?: string, "acceptanceCriteria"?: string[]}], "failureReason"?: string }',
     ].join("\n");
 
@@ -975,6 +1122,12 @@ export class Orchestrator {
       prompt,
       handoffId: handoff.id,
       goalId: handoff.goalId,
+      domainHints: [
+        goal?.prompt,
+        handoff.objective,
+        handoff.contextSummary,
+        goal?.contextDigest,
+      ],
     });
 
     handoff.conversationRunIds = [...handoff.conversationRunIds, run.id];
@@ -997,7 +1150,25 @@ export class Orchestrator {
       : null;
 
     if (!parsed) {
-      // Treat finished-but-unparsed as done with raw summary
+      const rawSummary = compressResultSummary(
+        run.resultText?.slice(0, 2000) ?? "No structured result",
+        caps,
+      );
+      run.resultSummary = rawSummary;
+      updateRun(this.db, run);
+      if (handoff.goalId && rawSummary) {
+        const digest = appendGoalDigest(
+          getGoal(this.db, handoff.goalId)?.contextDigest,
+          formatDigestLine({
+            role: handoff.toRole,
+            status: "done",
+            summary: rawSummary,
+            caps,
+          }),
+          caps,
+        );
+        updateGoalDigest(this.db, handoff.goalId, digest);
+      }
       handoff.status = "done";
       handoff.artifacts = [
         {
@@ -1010,6 +1181,25 @@ export class Orchestrator {
       updateHandoff(this.db, handoff);
       bus.emit({ type: "handoff_updated", handoff });
       return handoff;
+    }
+
+    const resultSummary = compressResultSummary(parsed.summary, caps);
+    run.resultSummary = resultSummary;
+    updateRun(this.db, run);
+
+    if (handoff.goalId && resultSummary) {
+      const digest = appendGoalDigest(
+        getGoal(this.db, handoff.goalId)?.contextDigest,
+        formatDigestLine({
+          role: handoff.toRole,
+          status: parsed.status,
+          summary: resultSummary,
+          artifacts: parsed.artifacts,
+          caps,
+        }),
+        caps,
+      );
+      updateGoalDigest(this.db, handoff.goalId, digest);
     }
 
     if (parsed.status === "failed" || parsed.status === "blocked") {
@@ -1026,22 +1216,48 @@ export class Orchestrator {
     bus.emit({ type: "handoff_updated", handoff });
 
     for (const follow of parsed.followUpHandoffs) {
-      if (!canHandoff(handoff.toRole, follow.toRole)) continue;
+      const resolved = resolveFollowUpHandoff(handoff.toRole, follow);
+      if (!resolved) {
+        console.warn(
+          `Dropped follow-up ${handoff.toRole}→${follow.toRole}: no allowed edge`,
+        );
+        continue;
+      }
       if (
-        follow.toRole !== "pm" &&
-        follow.toRole !== "qa" &&
-        !this.config.enabledRoles.includes(follow.toRole)
+        resolved.toRole !== "pm" &&
+        resolved.toRole !== "qa" &&
+        !this.config.enabledRoles.includes(resolved.toRole)
       ) {
         continue;
       }
+      if (resolved.routedViaPm) {
+        console.log(
+          `Follow-up ${handoff.toRole}→devops escalated as pm→devops (${handoff.id})`,
+        );
+      }
       this.createHandoffRecord({
-        fromRole: handoff.toRole,
-        toRole: follow.toRole,
-        objective: follow.objective,
-        contextSummary: follow.contextSummary,
-        acceptanceCriteria: follow.acceptanceCriteria,
+        fromRole: resolved.fromRole,
+        toRole: resolved.toRole,
+        objective: resolved.objective,
+        contextSummary: compressContextSummary(
+          [
+            resolved.contextSummary,
+            resultSummary
+              ? `Prior ${handoff.toRole}: ${resultSummary}`
+              : "",
+          ]
+            .filter(Boolean)
+            .join("\n"),
+          caps,
+        ),
+        acceptanceCriteria: resolved.acceptanceCriteria,
         parentHandoffId: handoff.id,
         goalId: handoff.goalId,
+        gatePhase: gatePhaseForFollowUp(
+          handoff.toRole,
+          resolved.toRole,
+          resolved.objective,
+        ),
       });
     }
 

@@ -14,7 +14,20 @@
   "serverPort": 8787,
   "webPort": 5173,
   "ceoAutoApprove": true,
-  "silentStallMs": 90000,
+  "silentStallMs": 120000,
   "maxSilentRetries": 2,
-  "silentWatchdogIntervalMs": 15000
+  "silentWatchdogIntervalMs": 15000,
+  "sequentialPipeline": true,
+  "maxConcurrentPerGoal": 1,
+  "freshAgentPerRun": true,
+  "maxRoleOverridesInPrompt": 3,
+  "contextCaps": {
+    "objective": 400,
+    "contextSummary": 800,
+    "acceptanceCriteriaItem": 120,
+    "maxAcceptanceCriteria": 5,
+    "digest": 1500,
+    "resultSummary": 500,
+    "roleOverride": 300
+  }
 }

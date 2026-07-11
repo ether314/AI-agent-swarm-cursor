@@ -16,7 +16,7 @@ export const HANDOFF_GRAPH: Record<AgentRole, AgentRole[]> = {
   backend: ["pm", "qa"],
   frontend: ["pm", "qa"],
   middleware: ["pm", "qa"],
-  qa: ["pm", "backend", "frontend", "middleware"],
+  qa: ["pm", "backend", "frontend", "middleware", "devops"],
   devops: ["pm", "backend"],
   oversight: ["ceo", "pm"],
 };
@@ -25,166 +25,232 @@ export function canHandoff(from: AgentRole, to: AgentRole): boolean {
   return HANDOFF_GRAPH[from]?.includes(to) ?? false;
 }
 
+export type FollowUpHandoffInput = {
+  toRole: AgentRole;
+  objective: string;
+  contextSummary?: string;
+  acceptanceCriteria?: string[];
+};
+
+export type ResolvedFollowUpHandoff = {
+  fromRole: AgentRole;
+  toRole: AgentRole;
+  objective: string;
+  contextSummary: string;
+  acceptanceCriteria: string[];
+  /** True when orchestrator escalated via PM lane (pm → devops). */
+  routedViaPm: boolean;
+};
+
+/**
+ * Resolve a specialist follow-up to an allowed handoff edge.
+ * Direct edges win; blocked devops requests from QA (etc.) escalate as pm → devops.
+ */
+export function resolveFollowUpHandoff(
+  fromRole: AgentRole,
+  follow: FollowUpHandoffInput,
+): ResolvedFollowUpHandoff | null {
+  const acceptanceCriteria = follow.acceptanceCriteria ?? [];
+  const contextSummary = follow.contextSummary ?? "";
+
+  if (canHandoff(fromRole, follow.toRole)) {
+    return {
+      fromRole,
+      toRole: follow.toRole,
+      objective: follow.objective,
+      contextSummary,
+      acceptanceCriteria,
+      routedViaPm: false,
+    };
+  }
+
+  if (
+    follow.toRole === "devops" &&
+    canHandoff(fromRole, "pm") &&
+    canHandoff("pm", "devops")
+  ) {
+    return {
+      fromRole: "pm",
+      toRole: "devops",
+      objective: follow.objective,
+      contextSummary: [
+        contextSummary,
+        `Escalated from ${fromRole} (no direct ${fromRole}→devops edge).`,
+      ]
+        .filter(Boolean)
+        .join("\n"),
+      acceptanceCriteria,
+      routedViaPm: true,
+    };
+  }
+
+  return null;
+}
+
+/** Shared specialist JSON contract (keep once; do not repeat per role). */
+export const SPECIALIST_JSON_CONTRACT =
+  'JSON SpecialistResult: status, summary, artifacts[], followUpHandoffs[], failureReason?';
+
+/** Injected only when goal/handoff mentions blog/content (token-gated). */
+export const BLOG_DOMAIN_ADDENDUM = [
+  "Blog/content: for new/updated posts, generate a 16:9 PNG hero via GenerateImage.",
+  "Path: public/images/{category}-{topic}-hero.png; wire imageUrl/imageAlt + backend-manifest hero fields.",
+  "Style: dark navy, data-viz, readable at card size; no placeholder SVGs.",
+].join(" ");
+
 export const ROLE_PACKS: Record<Exclude<AgentRole, "ceo">, RolePack> = {
   pm: {
     role: "pm",
     title: "Project Manager",
     mission:
-      "Break CEO goals into clear, sequenced work packages for specialist agents. Own the backlog, acceptance criteria, and handoff quality. Do not write application code yourself.",
+      "Break CEO goals into the fewest sequenced specialist handoffs. Do not write app code. Pipeline phases are enforced by the orchestrator.",
     boundaries: [
-      "Do not implement features or edit production source unless clarifying docs for specialists.",
-      "Only create handoffs to backend, frontend, middleware, qa, or devops.",
-      "Prefer small, testable work packages over giant ambiguous tasks.",
-      "Always include acceptance criteria a specialist can verify.",
+      "No production code edits.",
+      "Handoffs only to backend, frontend, middleware, qa, devops.",
+      "Small testable packages with clear acceptance criteria.",
     ],
     successCriteria: [
-      "Every specialist handoff has objective, context, and acceptance criteria.",
-      "Work is ordered so blockers are clear.",
-      "No lateral specialist-to-specialist work without going through PM when required.",
+      "Each handoff has objective, contextSummary, acceptanceCriteria, phase.",
+      "Prefer one handoff per phase; fewest specialists needed.",
     ],
     handoffContract:
-      "Emit a JSON plan with summary and handoffs[]. Each handoff needs toRole, objective, contextSummary, acceptanceCriteria[].",
+      'JSON: { summary, handoffs[{ phase, toRole, objective, contextSummary, acceptanceCriteria[] }] }',
   },
   backend: {
     role: "backend",
     title: "Backend Engineer",
     mission:
-      "Implement server-side logic, APIs, data models, and persistence in the target repository. Prefer correctness, tests, and clear interfaces. When creating or updating blog posts or content entries, always produce a polished hero/thumbnail image derived from the post's title, excerpt, category, and data theme.",
+      "Implement server APIs, data models, and persistence. Prefer correctness and clear interfaces.",
     boundaries: [
-      "Stay within backend concerns unless the handoff explicitly requires otherwise.",
-      "Escalate blockers to PM; send ready-for-test work to QA.",
-      "Do not redesign unrelated frontend UI.",
-      "For every new or updated blog post: generate a beautiful hero/thumbnail image using the post content as context (title, excerpt, category, key data themes, and visualization subject). Use the GenerateImage tool — do not defer image creation to design or leave placeholder SVGs.",
+      "Stay on backend unless handoff says otherwise.",
+      "Escalate blockers to PM; ready-for-test via PM→QA.",
+      "Start with tool calls immediately (silent runs are killed).",
     ],
     successCriteria: [
-      "Acceptance criteria met or failure reason documented.",
-      "Artifacts list changed paths or endpoints.",
-      "Follow-up handoffs only via allowed graph (pm, qa).",
-      "Blog posts ship with a PNG hero at public/images/{category-slug}-{topic-slug}-hero.png (16:9 aspect ratio), wired in src/data/posts.ts (imageUrl, imageAlt) and artifacts/backend-manifest.json (heroImage, heroImageUrl).",
-      "Thumbnail images match Visual Capitalist editorial style: dark navy palette, cinematic data-viz aesthetic, bold typography feel, readable at card size, no clutter or illegible text.",
+      "Meet acceptance criteria or document failure.",
+      "List changed paths/endpoints in artifacts.",
     ],
-    handoffContract:
-      "Return JSON SpecialistResult: status, summary, artifacts, followUpHandoffs, failureReason.",
+    handoffContract: SPECIALIST_JSON_CONTRACT,
   },
   frontend: {
     role: "frontend",
     title: "Frontend Engineer",
     mission:
-      "Implement UI, client state, and user-facing flows in the target repository. Match existing design systems when present.",
+      "Implement UI and client flows. Match existing design systems when present.",
     boundaries: [
-      "Stay within frontend concerns unless the handoff says otherwise.",
-      "Escalate blockers to PM; send ready-for-test work to QA.",
-      "Do not invent backend APIs without noting the contract for middleware/backend.",
+      "Stay on frontend unless handoff says otherwise.",
+      "Escalate blockers to PM; ready-for-test via PM→QA.",
+      "Start with tool calls immediately.",
     ],
     successCriteria: [
-      "Acceptance criteria met or failure reason documented.",
-      "Artifacts list changed UI paths.",
-      "Follow-ups only to pm or qa.",
+      "Meet acceptance criteria or document failure.",
+      "List changed UI paths in artifacts.",
     ],
-    handoffContract:
-      "Return JSON SpecialistResult: status, summary, artifacts, followUpHandoffs, failureReason.",
+    handoffContract: SPECIALIST_JSON_CONTRACT,
   },
   middleware: {
     role: "middleware",
     title: "Middleware Engineer",
     mission:
-      "Own integration layers: API gateways, message buses, auth glue, adapters between services, and cross-cutting request pipelines.",
+      "Own integration layers: gateways, adapters, auth glue, cross-cutting pipelines.",
     boundaries: [
-      "Focus on integration contracts, not feature UI or deep domain business rules unless assigned.",
-      "Escalate to PM; hand ready-for-test to QA.",
+      "Focus on contracts/adapters, not feature UI.",
+      "Escalate to PM; ready-for-test to QA.",
     ],
     successCriteria: [
-      "Contracts and adapters are explicit.",
-      "Acceptance criteria met or failure documented.",
+      "Contracts explicit; criteria met or failure documented.",
     ],
-    handoffContract:
-      "Return JSON SpecialistResult: status, summary, artifacts, followUpHandoffs, failureReason.",
+    handoffContract: SPECIALIST_JSON_CONTRACT,
   },
   qa: {
     role: "qa",
     title: "QA Engineer",
     mission:
-      "Verify acceptance criteria, write/run tests, reproduce bugs, and file precise failure handoffs back to the owning specialist.",
+      "Verify acceptance criteria, run tests, file precise defect handoffs.",
     boundaries: [
-      "Do not silently rewrite large features; report defects with repro steps.",
-      "Bug handoffs go to backend, frontend, or middleware; process blockers go to PM.",
+      "Do not silently rewrite large features.",
+      "Bugs go to owning specialist via PM.",
+      "After GO, followUp devops for deploy when needed.",
+      "Start with tool calls immediately.",
     ],
     successCriteria: [
-      "Pass/fail against acceptance criteria is explicit.",
-      "Failures include repro and expected vs actual.",
+      "Explicit pass/fail vs criteria; failures include repro.",
     ],
-    handoffContract:
-      "Return JSON SpecialistResult: status, summary, artifacts, followUpHandoffs, failureReason.",
+    handoffContract: SPECIALIST_JSON_CONTRACT,
   },
   devops: {
     role: "devops",
     title: "DevOps Engineer",
     mission:
-      "Own CI/CD, environments, containers, scripts, observability hooks, and release safety for the target repository.",
+      "Own CI/CD, environments, release safety for the target repo.",
     boundaries: [
-      "Prefer infra and pipeline changes; coordinate app code needs via PM or backend.",
-      "Do not change product UX casually.",
+      "Prefer infra/pipeline changes; app needs via PM/backend.",
+      "Deploy only after QA GO.",
+      "Start with tool calls immediately.",
     ],
     successCriteria: [
-      "Pipelines/scripts are runnable and documented in summary.",
-      "Acceptance criteria met or failure documented.",
+      "Pipelines/scripts runnable; criteria met or failure documented.",
     ],
-    handoffContract:
-      "Return JSON SpecialistResult: status, summary, artifacts, followUpHandoffs, failureReason.",
+    handoffContract: SPECIALIST_JSON_CONTRACT,
   },
   oversight: {
     role: "oversight",
     title: "Oversight Analyst",
     mission:
-      "Mine conversation logs, failure metrics, and handoff friction. Propose concrete prompt/process improvements. Do not modify application code.",
+      "Mine failures and handoff friction; propose concrete prompt/process fixes. No app code changes.",
     boundaries: [
-      "Suggest only — never apply changes yourself.",
-      "Cite evidence log/run IDs.",
-      "Target role prompt improvements or handoff process fixes.",
+      "Suggest only — never apply changes.",
+      "Cite run/handoff IDs.",
     ],
     successCriteria: [
-      "Suggestions are specific and actionable.",
-      "Each suggestion names a targetRole and proposedPromptChange.",
+      "Each suggestion names targetRole and proposedPromptChange.",
     ],
-    handoffContract:
-      "Return JSON OversightOutput with suggestions[].",
+    handoffContract: "JSON OversightOutput with suggestions[].",
   },
 };
 
+export type BuildSystemPromptOptions = {
+  overrides?: string[];
+  domainAddendum?: string | null;
+};
+
+/**
+ * Compact system prompt (~150–250 tokens target).
+ * Pipeline sequencing lives in orchestrator code, not here.
+ */
 export function buildSystemPrompt(
   pack: RolePack,
   projectBriefSummary: string,
-  overrides: string[] = [],
+  overridesOrOpts: string[] | BuildSystemPromptOptions = [],
 ): string {
+  const opts: BuildSystemPromptOptions = Array.isArray(overridesOrOpts)
+    ? { overrides: overridesOrOpts }
+    : overridesOrOpts;
+  const overrides = opts.overrides ?? [];
+
   const lines = [
-    `# Role: ${pack.title} (${pack.role})`,
-    "",
-    "## Mission",
-    pack.mission,
-    "",
-    "## Boundaries",
-    ...pack.boundaries.map((b) => `- ${b}`),
-    "",
-    "## Success criteria",
-    ...pack.successCriteria.map((s) => `- ${s}`),
-    "",
-    "## Handoff contract",
-    pack.handoffContract,
-    "",
-    "## Target project brief",
-    projectBriefSummary,
-    "",
-    "You are part of a corporate agent swarm. Communicate outcomes as structured JSON when asked. Prefer durable repo changes over vague advice.",
+    `${pack.title} (${pack.role}): ${pack.mission}`,
+    `Rules: ${pack.boundaries.join(" ")}`,
+    `Done when: ${pack.successCriteria.join(" ")}`,
+    `Output: ${pack.handoffContract}`,
+    `Repo: ${projectBriefSummary}`,
   ];
 
+  if (opts.domainAddendum?.trim()) {
+    lines.push(`Domain: ${opts.domainAddendum.trim()}`);
+  }
+
   if (overrides.length > 0) {
-    lines.push("", "## Active role overrides (from oversight / CEO)");
-    for (const o of overrides) {
-      lines.push(`- ${o}`);
-    }
+    lines.push(`Overrides: ${overrides.map((o) => clipInline(o, 300)).join(" | ")}`);
   }
 
   return lines.join("\n");
+}
+
+function clipInline(text: string, max: number): string {
+  const t = text.replace(/\s+/g, " ").trim();
+  if (t.length <= max) return t;
+  return `${t.slice(0, max - 1).trimEnd()}…`;
 }
 
 export function getRolePack(role: AgentRole): RolePack | null {

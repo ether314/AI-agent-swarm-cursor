@@ -1,5 +1,5 @@
 import { v4 as uuid } from "uuid";
-import type { Goal } from "@corp-swarm/schema";
+import type { Goal, SwarmConfig } from "@corp-swarm/schema";
 import type { Db } from "./db.js";
 import {
   countQueuedHandoffs,
@@ -14,6 +14,7 @@ import {
   updateGoalStatus,
 } from "./db.js";
 import { bus } from "./events.js";
+import { listRunnableHandoffs, resolveGoalOutcome } from "./handoff-gates.js";
 import type { Orchestrator } from "./orchestrator.js";
 
 export class SwarmQueue {
@@ -25,6 +26,10 @@ export class SwarmQueue {
     private db: Db,
     private orchestrator: Orchestrator,
     private maxConcurrent: number,
+    private pipelineConfig: Pick<
+      SwarmConfig,
+      "sequentialPipeline" | "maxConcurrentPerGoal"
+    >,
   ) {}
 
   start(intervalMs = 1500): void {
@@ -69,6 +74,7 @@ export class SwarmQueue {
       title: title?.trim() || prompt.slice(0, 80),
       prompt,
       status: "queued",
+      contextDigest: null,
       createdAt: now(),
       updatedAt: now(),
     };
@@ -103,8 +109,15 @@ export class SwarmQueue {
     if (isPaused(this.db)) return;
     this.tickInFlight = true;
     try {
+      const allHandoffs = listHandoffs(this.db);
       const queued = listQueuedHandoffs(this.db);
-      for (const handoff of queued) {
+      const runnable = listRunnableHandoffs(
+        queued,
+        allHandoffs,
+        this.pipelineConfig,
+      );
+
+      for (const handoff of runnable) {
         if (this.processingRoles.has(handoff.toRole)) continue;
         if (this.orchestrator.getActiveRunCount() >= this.maxConcurrent) break;
 
@@ -148,21 +161,11 @@ export class SwarmQueue {
       if (goal.status !== "executing") continue;
       const related = listHandoffs(this.db).filter((h) => h.goalId === goal.id);
       if (related.length === 0) continue;
-      const pending = related.some(
-        (h) =>
-          h.status === "queued" ||
-          h.status === "accepted" ||
-          h.status === "in_progress",
-      );
-      if (pending) continue;
-      const anyFailed = related.some(
-        (h) => h.status === "failed" || h.status === "rejected",
-      );
-      const updated = updateGoalStatus(
-        this.db,
-        goal.id,
-        anyFailed ? "failed" : "done",
-      );
+
+      const outcome = resolveGoalOutcome(related, this.pipelineConfig);
+      if (!outcome) continue;
+
+      const updated = updateGoalStatus(this.db, goal.id, outcome);
       bus.emit({ type: "goal_updated", goal: updated });
     }
   }
