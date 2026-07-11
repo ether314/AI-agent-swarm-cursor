@@ -55,10 +55,34 @@ function isStaleBusyAgentError(err: unknown): boolean {
   return /already has active run/i.test(msg);
 }
 
+/** Strip orchestrator banner lines to detect runs that produced no agent output. */
+function isSilentAgentOutput(streamed: string): boolean {
+  const body = streamed.replace(/\[orchestrator\][^\n]*\n?/g, "").trim();
+  return body.length === 0;
+}
+
+/** Extract terminal failure details from a Cursor SDK RunResult when present. */
+function formatSdkRunError(result: {
+  id?: string;
+  error?: { message?: string; code?: string };
+  result?: string;
+}): string {
+  const parts: string[] = [];
+  if (result.error?.message) parts.push(result.error.message);
+  if (result.error?.code) parts.push(`code=${result.error.code}`);
+  if (parts.length > 0) return parts.join(" · ");
+  if (result.result?.trim()) return result.result.trim().slice(0, 500);
+  return `Cursor run ${result.id ?? "unknown"} failed`;
+}
+
+/** Rotate long-lived agents to avoid context bloat and silent SDK failures. */
+const AGENT_ROTATE_AFTER_RUNS = 6;
+
 export class Orchestrator {
   private active = new Map<AgentRole, ActiveAgent>();
   private inflight = new Map<AgentRole, InflightRun>();
   private runningCount = 0;
+  private finishedRunsPerRole = new Map<AgentRole, number>();
 
   constructor(
     private db: Db,
@@ -323,6 +347,24 @@ export class Orchestrator {
     return this.createFreshAgent(role);
   }
 
+  private noteFinishedRun(role: AgentRole): void {
+    const count = (this.finishedRunsPerRole.get(role) ?? 0) + 1;
+    this.finishedRunsPerRole.set(role, count);
+    if (count >= AGENT_ROTATE_AFTER_RUNS) {
+      console.warn(
+        `Agent for ${role} reached ${count} finished runs — rotating to fresh agent`,
+      );
+      this.finishedRunsPerRole.set(role, 0);
+      void this.disposeRoleAgent(role);
+    }
+  }
+
+  private async handleUnhealthyAgent(role: AgentRole, reason: string): Promise<void> {
+    console.warn(`Disposing ${role} agent after unhealthy run: ${reason}`);
+    await this.disposeRoleAgent(role);
+    this.finishedRunsPerRole.set(role, 0);
+  }
+
   private getSystemPrompt(role: AgentRole): string {
     const pack = getRolePack(role);
     if (!pack) return "";
@@ -494,16 +536,27 @@ export class Orchestrator {
       }
 
       if (result.status === "error") {
+        const failureMessage = formatSdkRunError(result);
+        const silent = isSilentAgentOutput(streamed);
+        if (silent && result.error?.message) {
+          emitChunk(`\n[orchestrator] SDK error: ${failureMessage}\n`);
+        }
         run = {
           ...run,
           status: "error",
           failureKind: "run_error",
-          failureMessage: `Cursor run ${result.id} failed`,
+          failureMessage,
           resultText: streamed || result.result || null,
           transcriptJson: transcript ? JSON.stringify(transcript) : null,
           finishedAt,
           durationMs,
         };
+        if (silent) {
+          await this.handleUnhealthyAgent(
+            opts.role,
+            `silent run_error (${failureMessage})`,
+          );
+        }
       } else if (result.status === "cancelled") {
         run = {
           ...run,
@@ -522,6 +575,7 @@ export class Orchestrator {
           finishedAt,
           durationMs,
         };
+        this.noteFinishedRun(opts.role);
       }
       updateRun(this.db, run);
       insertMetricEvent(this.db, {
@@ -530,7 +584,13 @@ export class Orchestrator {
         kind: `run_${run.status}`,
         handoffId: opts.handoffId,
         runId: run.id,
-        payload: { durationMs, cursorRunId: run.cursorRunId },
+        payload: {
+          durationMs,
+          cursorRunId: run.cursorRunId,
+          failureMessage: run.failureMessage ?? undefined,
+          silentFailure:
+            run.status === "error" ? isSilentAgentOutput(streamed) : undefined,
+        },
       });
       bus.emit({ type: "run_finished", run });
       return run;
@@ -547,6 +607,12 @@ export class Orchestrator {
         durationMs,
       };
       updateRun(this.db, run);
+      if (!isStartup) {
+        await this.handleUnhealthyAgent(
+          opts.role,
+          run.failureMessage ?? "run exception",
+        );
+      }
       insertMetricEvent(this.db, {
         id: uuid(),
         role: opts.role,
